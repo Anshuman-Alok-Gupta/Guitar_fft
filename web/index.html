@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FFT Guitar Detector</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>FFT Guitar Detector</h1>
+  </div>
+
+  <div class="source" id="source">
+    <span class="dot" id="conn-dot" title="connection"></span>
+    <span id="source-label">connecting…</span>
+    <button class="btn small ghost invisible" id="stop-file">Stop file</button>
+  </div>
+
+  <div class="meter" title="Input level vs. noise gate">
+    <div class="meter-track"><div class="meter-fill" id="meter-fill"></div><div class="meter-gate" id="meter-gate"></div></div>
+    <span class="meter-label" id="meter-label">— dB</span>
+  </div>
+
+  <div class="controls">
+    <div class="seg" role="tablist" aria-label="Mode">
+      <button role="tab" class="seg-btn active" data-mode="chord" aria-selected="true">Chord</button>
+      <button role="tab" class="seg-btn" data-mode="tuner" aria-selected="false">Tuner</button>
+    </div>
+    <button class="btn" id="btn-calibrate" title="Measure room noise for 1 s (C)">Calibrate</button>
+    <button class="btn" id="btn-freeze" title="Pause the display (Space)">Freeze</button>
+    <button class="btn" id="btn-present" title="Larger text for a projector or audience (P)" aria-pressed="false">Present</button>
+    <details class="settings">
+      <summary class="btn">Settings</summary>
+      <div class="settings-panel">
+        <label>Input device<select id="device-select"><option value="">System default</option></select></label>
+        <label>A4 reference (Hz)<input type="number" id="a4-input" min="400" max="480" step="0.5" value="440"></label>
+        <label>Gate above noise: <b id="gate-val">12</b> dB<input type="range" id="gate-input" min="3" max="40" step="1" value="12"></label>
+        <label>Recordings<select id="rec-select"><option value="">— play a recording —</option></select></label>
+        <div class="settings-actions">
+          <label class="btn small" title="Analyse a WAV file">Upload WAV<input type="file" id="file-input" accept=".wav,audio/wav" hidden></label>
+          <button class="btn small" id="btn-record" title="Save the last 5 s of mic audio">Record 5 s</button>
+        </div>
+        <label class="row"><input type="checkbox" id="show-hps"> Show HPS curve</label>
+        <label class="row"><input type="checkbox" id="show-floor" checked> Show noise floor</label>
+        <button class="btn small" id="btn-theme">Toggle light / dark</button>
+      </div>
+    </details>
+  </div>
+</header>
+
+<main class="grid">
+  <div class="main-col">
+  <section class="card hero" id="hero" aria-live="polite">
+    <div class="hero-main">
+      <div class="hero-label" id="hero-label">Chord</div>
+      <div class="hero-value" id="hero-value">—</div>
+      <div class="hero-long" id="hero-long">Play something</div>
+    </div>
+    <div class="hero-side">
+      <div class="chips" id="note-chips"></div>
+      <div class="tuner hidden" id="tuner">
+        <svg viewBox="0 0 300 120" class="tuner-svg" aria-hidden="true">
+          <path d="M30 110 A120 120 0 0 1 270 110" class="tuner-arc"/>
+          <g id="tuner-ticks"></g>
+          <line id="tuner-needle" x1="150" y1="110" x2="150" y2="10" class="tuner-needle"/>
+          <circle cx="150" cy="110" r="5" class="tuner-hub"/>
+        </svg>
+        <div class="tuner-read"><span id="tuner-status" class="status">—</span><span id="tuner-cents">— cents</span><span id="tuner-hz">— Hz</span><span id="tuner-string">—</span></div>
+      </div>
+      <div class="hero-meta" id="hero-meta">&nbsp;</div>
+    </div>
+  </section>
+
+  <section class="card spectrum-card">
+    <div class="card-head">
+      <h2>Spectrum — which frequencies are present <span class="muted">(Hann window · FFT · log frequency)</span></h2>
+      <div class="legend" id="spec-legend">
+        <span><i class="sw sw-line"></i>Spectrum</span>
+        <span><i class="sw sw-hold"></i>Peak hold</span>
+        <span id="lg-captured"><i class="sw sw-captured"></i>Captured chord</span>
+        <span id="lg-floor"><i class="sw sw-floor"></i>Noise floor</span>
+        <span id="lg-hps" class="hidden"><i class="sw sw-hps"></i>HPS</span>
+        <span><i class="sw sw-role" style="background:var(--role-0)"></i>Root</span>
+        <span><i class="sw sw-role" style="background:var(--role-1)"></i>3rd</span>
+        <span><i class="sw sw-role" style="background:var(--role-2)"></i>5th</span>
+        <span><i class="sw sw-role" style="background:var(--role-3)"></i>7th</span>
+      </div>
+    </div>
+    <div class="canvas-wrap spectrum-wrap">
+      <canvas id="spectrum"></canvas>
+      <div class="frozen-badge hidden" id="frozen-badge">FROZEN</div>
+      <div class="tooltip hidden" id="spec-tip"></div>
+    </div>
+  </section>
+
+  <section class="card spectrogram-card">
+    <div class="card-head"><h2>Spectrogram — spectrum over time <span class="muted">(last 10 s · brighter = louder)</span></h2></div>
+    <div class="canvas-wrap spectrogram-wrap"><canvas id="spectrogram"></canvas></div>
+  </section>
+  </div>
+
+  <aside class="side">
+    <section class="card">
+      <div class="card-head"><h2>Chroma — energy per note name <span class="muted">(all octaves folded)</span></h2></div>
+      <div class="canvas-wrap chroma-wrap">
+        <canvas id="chroma"></canvas>
+        <div class="tooltip hidden" id="chroma-tip"></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Closest chords <span class="muted">(template match · cosine)</span></h2></div>
+      <div id="candidates" class="candidates"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Detected notes <span class="muted">(harmonic summation)</span></h2></div>
+      <table class="notes-table">
+        <thead><tr><th>Note</th><th>Role</th><th class="num">f₀ (Hz)</th><th class="num">Salience</th><th class="num">Partials</th></tr></thead>
+        <tbody id="notes-body"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Chord history <span class="muted">(newest first)</span></h2>
+        <button class="btn small ghost" id="btn-clear-history" title="Clear the list">Clear</button>
+      </div>
+      <ol class="history" id="history"></ol>
+    </section>
+  </aside>
+</main>
+
+<div class="toast hidden" id="toast" role="status"></div>
+<audio id="player" preload="auto"></audio>
+<script type="module" src="app.js"></script>
+</body>
+</html>
