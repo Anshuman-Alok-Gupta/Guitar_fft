@@ -1,10 +1,13 @@
 import { SpectrumView, SpectrogramView, token } from "./spectrum.js";
 import { ChromaView, TunerView, fmtTime, renderCandidates, renderChips, renderHistory, renderNotesTable } from "./widgets.js";
+import { BrowserMic } from "./mic.js";
 
 const $ = (id) => document.getElementById(id);
 
 const state = {
   ws: null,
+  sid: "",           // this tab's server session, for the HTTP endpoints
+  serverMicAsked: false,   // user picked a server mic: report it if it fails
   mode: "chord",
   frozen: false,
   frame: null,       // latest frame (what is drawn)
@@ -56,11 +59,35 @@ function send(obj) {
   if (state.ws && state.ws.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
 }
 
+const api = (path) => `${path}${path.includes("?") ? "&" : "?"}sid=${encodeURIComponent(state.sid)}`;
+
+// ------------------------------------------------------------------ browser microphone
+// PCM chunks go straight to the server. If the connection backs up (slow network), chunks
+// are dropped rather than queued, so the analysis stays live instead of falling behind.
+const mic = new BrowserMic((buf) => {
+  const ws = state.ws;
+  if (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 256 * 1024) ws.send(buf);
+});
+
+async function startBrowserMic(deviceId = "") {
+  try {
+    await mic.start(deviceId);
+    send({ cmd: "browser_mic", fs: mic.fs, name: mic.label });
+    toast("Microphone on: calibrating, stay quiet for 1 s");
+  } catch (err) {
+    toast(`Microphone failed: ${err.message}`, 6000);
+  }
+}
+$("btn-mic").addEventListener("click", () => startBrowserMic());
+
 // ------------------------------------------------------------------ websocket
 function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   state.ws = ws;
-  ws.onopen = () => $("conn-dot").classList.add("ok");
+  ws.onopen = () => {
+    $("conn-dot").classList.add("ok");
+    if (mic.running) send({ cmd: "browser_mic", fs: mic.fs, name: mic.label });   // new session after a reconnect
+  };
   ws.onclose = () => {
     $("conn-dot").classList.remove("ok");
     $("source-label").textContent = "disconnected — retrying…";
@@ -76,6 +103,7 @@ function connect() {
 
 function onStatus(s) {
   state.status = s;
+  state.sid = s.sid;
   if (s.freqs) {
     spectrum.setFreqs(s.freqs);
     sgram.setFreqs(s.freqs);
@@ -87,11 +115,14 @@ function onStatus(s) {
 
   const src = s.source;
   const label = $("source-label");
-  if (!src) label.textContent = s.mic_error ? `No microphone (${s.mic_error}) — upload a WAV` : "No input";
-  else if (src.kind === "mic") label.textContent = `🎤 ${src.name} · ${src.fs} Hz`;
-  else label.textContent = `▶ ${src.name}`;
+  if (!src) label.textContent = "No input: enable the mic or upload a WAV";
+  else if (src.kind === "file") label.textContent = `▶ ${src.name}`;
+  else label.textContent = `🎤 ${src.name} · ${src.fs} Hz`;
   $("stop-file").classList.toggle("invisible", !src || src.kind !== "file");   // keeps its space: no top-bar jump
-  if (s.mic_error && src?.kind !== "file") toast(`Microphone unavailable: ${s.mic_error}`, 5000);
+  $("btn-mic").classList.toggle("hidden", !!s.live);
+  if (!src) $("hero-long").textContent = "Press “Enable mic” to start";
+  if (s.mic_error && state.serverMicAsked) toast(`Microphone unavailable: ${s.mic_error}`, 5000);
+  state.serverMicAsked = false;
 }
 
 function onFrame(f) {
@@ -250,7 +281,7 @@ $("file-input").addEventListener("change", async (e) => {
   const fd = new FormData();
   fd.append("file", file);
   try {
-    const r = await fetch("/api/upload", { method: "POST", body: fd });
+    const r = await fetch(api("/api/upload"), { method: "POST", body: fd });
     const j = await r.json();
     if (!r.ok) throw new Error(j.detail || r.statusText);
     playLocal(URL.createObjectURL(file));
@@ -271,7 +302,7 @@ $("stop-file").addEventListener("click", () => { send({ cmd: "stop_file" }); $("
 
 $("btn-record").addEventListener("click", async () => {
   try {
-    const r = await fetch("/api/record?sec=5&label=" + encodeURIComponent(state.frame?.chord?.name || ""), { method: "POST" });
+    const r = await fetch(api("/api/record?sec=5&label=" + encodeURIComponent(state.frame?.chord?.name || "")), { method: "POST" });
     const j = await r.json();
     if (!r.ok) throw new Error(j.detail || r.statusText);
     toast(`Saved ${j.name}`);
@@ -293,22 +324,42 @@ $("rec-select").addEventListener("change", async (e) => {
   const name = e.target.value;
   if (!name) return;
   e.target.value = "";
-  const r = await fetch(`/api/play/${name}`, { method: "POST" });
+  const r = await fetch(api(`/api/play/${name}`), { method: "POST" });
   const j = await r.json();
   if (!r.ok) { toast(`Cannot play: ${j.detail}`, 5000); return; }
   playLocal(`/recordings/${name}`);
   toast(`Playing ${j.name}`);
 });
 
+// Input devices: "b:<id>" = a mic in this browser, "s:<id>" = a mic on the server machine
+// (only listed when the server has audio hardware, i.e. when running locally).
 async function loadDevices() {
-  try {
-    const j = await (await fetch("/api/devices")).json();
-    const sel = $("device-select");
-    sel.innerHTML = `<option value="">System default</option>` + j.devices.map((d) =>
-      `<option value="${d.id}" ${d.id === j.current ? "selected" : ""}>${d.name.replace(/</g, "&lt;")} (${d.api}, ${d.samplerate} Hz)${d.default ? " ★" : ""}</option>`).join("");
-  } catch { /* ignore */ }
+  const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  let browser = [], server = [];
+  try { browser = await BrowserMic.devices(); } catch { /* ignore */ }
+  try { server = (await (await fetch("/api/devices")).json()).devices; } catch { /* ignore */ }
+  const s = state.status;
+  const current = mic.running ? `b:${mic.deviceId}` : s?.live === "mic" ? `s:${s.mic_device ?? ""}` : "";
+  const opt = (v, text) => `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(text)}</option>`;
+  let html = current ? "" : `<option value="" selected>— none —</option>`;
+  html += `<optgroup label="This browser">${opt("b:", "Default microphone")}` +
+    browser.filter((d) => d.deviceId && d.deviceId !== "default")
+      .map((d, i) => opt(`b:${d.deviceId}`, d.label || `Microphone ${i + 1}`)).join("") + "</optgroup>";
+  if (server.length) {
+    html += `<optgroup label="Server (sounddevice)">${opt("s:", "System default")}` +
+      server.map((d) => opt(`s:${d.id}`, `${d.name} (${d.api}, ${d.samplerate} Hz)${d.default ? " ★" : ""}`)).join("") + "</optgroup>";
+  }
+  $("device-select").innerHTML = html;
 }
-$("device-select").addEventListener("change", (e) => { send({ cmd: "device", value: e.target.value }); toast("Switching input — calibrating"); });
+$("device-select").addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (v.startsWith("b:")) { startBrowserMic(v.slice(2)); return; }
+  if (!v.startsWith("s:")) return;
+  mic.stop();
+  state.serverMicAsked = true;
+  send({ cmd: "device", value: v.slice(2) });
+  toast("Switching input: calibrating");
+});
 $("a4-input").addEventListener("change", (e) => send({ cmd: "a4", value: parseFloat(e.target.value) || 440 }));
 $("gate-input").addEventListener("input", (e) => { $("gate-val").textContent = e.target.value; });
 $("gate-input").addEventListener("change", (e) => send({ cmd: "gate", value: parseFloat(e.target.value) }));

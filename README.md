@@ -15,8 +15,12 @@ python -m venv .venv                              # once
 .venv\Scripts\python -m server                    # opens http://127.0.0.1:8000
 ```
 
+Run locally, it listens to your computer's microphone straight away. Under Settings → Input device you can also switch to **This browser** mics.
+
+**Online version:** https://dsp-cie-production.up.railway.app. The cloud server has no microphone, so press **🎤 Enable mic** and allow access. The browser then streams raw mic audio (with echo cancellation, noise suppression and AGC off) to the server over the WebSocket. Each browser tab gets its own session. Redeploy with `railway up -s dsp-cie` (the start command is in `railpack.json`).
+
 Options:
-- `--device ID` picks an input device. The list is in Settings or at `/api/devices`.
+- `--device ID` picks a server input device. The list is in Settings or at `/api/devices`.
 - `--port 8000` sets the port.
 - `--no-browser` starts the server without opening a browser.
 

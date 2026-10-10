@@ -57,7 +57,25 @@ def list_input_devices():
     return out
 
 
-class MicSource:
+class _LiveSource:
+    """A live input that keeps its last few seconds in a ring buffer."""
+
+    def window(self, n: int) -> np.ndarray:
+        return self.ring.latest(n)
+
+    def recent(self, sec: float) -> np.ndarray:
+        return self.ring.latest(min(int(sec * self.fs), len(self.ring.buf)))
+
+    @property
+    def finished(self):
+        return False
+
+    def close(self):
+        pass
+
+
+class MicSource(_LiveSource):
+    """A microphone on the machine running the server (sounddevice / PortAudio)."""
     kind = "mic"
 
     def __init__(self, device=None, buffer_sec: float = 15.0):
@@ -76,22 +94,27 @@ class MicSource:
             self.status_errors += 1
         self.ring.write(indata[:, 0])                  # first channel only (mono)
 
-    def window(self, n: int) -> np.ndarray:
-        return self.ring.latest(n)
-
-    def recent(self, sec: float) -> np.ndarray:
-        return self.ring.latest(min(int(sec * self.fs), len(self.ring.buf)))
-
-    @property
-    def finished(self):
-        return False
-
     def close(self):
         try:
             self.stream.stop()
             self.stream.close()
         except Exception:
             pass
+
+
+class BrowserMicSource(_LiveSource):
+    """A microphone in the visitor's browser: the page streams 16-bit mono PCM chunks over
+    the WebSocket, so this works when the server itself has no audio hardware."""
+    kind = "browser"
+
+    def __init__(self, fs: int, name: str = "Browser microphone", buffer_sec: float = 15.0):
+        self.fs = int(fs)
+        self.name = name[:80] or "Browser microphone"
+        self.ring = RingBuffer(int(buffer_sec * self.fs))
+
+    def feed(self, data: bytes):
+        x = np.frombuffer(data[:len(data) & ~1], dtype="<i2")
+        self.ring.write(x.astype(np.float32) / 32768.0)
 
 
 def read_wav(data: bytes):

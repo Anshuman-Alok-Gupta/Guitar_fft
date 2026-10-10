@@ -1,35 +1,42 @@
-"""FastAPI backend: runs the DSP on the active audio source every hop and streams the
-results to the browser over a WebSocket."""
+"""FastAPI backend: every browser tab gets its own session (audio source + analyzer). The
+session runs the DSP every hop and streams the results to its tab over a WebSocket.
+
+Audio comes from one of three places:
+  - the visitor's browser microphone, streamed over the same WebSocket (works when deployed),
+  - a microphone on the machine running the server (sounddevice; local runs only),
+  - a WAV file, uploaded or picked from recordings/, played in real time."""
 import asyncio
 import json
 import re
+import secrets
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
 
 from dsp import Analyzer, Config
-from .sources import FileSource, MicSource, list_input_devices, read_wav, write_wav
+from .sources import BrowserMicSource, FileSource, MicSource, list_input_devices, read_wav, write_wav
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB_DIR = ROOT / "web"
 REC_DIR = ROOT / "recordings"
 REC_DIR.mkdir(exist_ok=True)
+MAX_UPLOAD = 50 * 1024 * 1024
 
 
-class Engine:
-    def __init__(self):
-        self.mic: MicSource | None = None
+class Session:
+    def __init__(self, ws: WebSocket):
+        self.sid = secrets.token_urlsafe(12)
+        self.ws = ws
+        self.mic: MicSource | BrowserMicSource | None = None    # the live input
         self.mic_device = None
         self.mic_error: str | None = None
         self.file: FileSource | None = None
         self.a4 = 440.0
         self.gate_db = Config.gate_db_above_noise
         self.analyzer: Analyzer | None = None
-        self.clients: set[WebSocket] = set()
         self.events: list[dict] = []
 
     # ---------- sources ----------
@@ -38,15 +45,28 @@ class Engine:
         return self.file or self.mic
 
     def open_mic(self, device=None):
-        if self.mic:
-            self.mic.close()
-            self.mic = None
+        self.close_mic()
         try:
             self.mic = MicSource(device)
             self.mic_device, self.mic_error = device, None
-        except Exception as e:                     # no mic / device busy: keep running for files
+        except Exception as e:                     # no mic / no PortAudio (e.g. in the cloud)
             self.mic_error = f"{type(e).__name__}: {e}"
         self._new_analyzer()
+
+    def open_browser_mic(self, fs, name):
+        self.close_mic()
+        self.mic = BrowserMicSource(int(np.clip(fs, 8000, 192000)), str(name or ""))
+        self.mic_device, self.mic_error = None, None
+        self._new_analyzer()
+
+    def close_mic(self):
+        if self.mic:
+            self.mic.close()
+            self.mic = None
+
+    def feed(self, data: bytes):
+        if isinstance(self.mic, BrowserMicSource):
+            self.mic.feed(data)
 
     def play_file(self, x, fs, name):
         self.file = FileSource(x, fs, name)
@@ -75,10 +95,12 @@ class Engine:
         src = self.source
         return {
             "type": "status",
+            "sid": self.sid,
             "source": None if src is None else {
                 "kind": src.kind, "name": src.name, "fs": src.fs,
                 "duration": getattr(src, "duration", None),
             },
+            "live": None if self.mic is None else self.mic.kind,
             "mic_error": self.mic_error,
             "mic_device": self.mic_device,
             "a4": self.a4,
@@ -100,33 +122,26 @@ class Engine:
 
             if self.file and self.file.finished:
                 self.stop_file()
-                await self.broadcast(self.status())
+                await self.send(self.status())
             for ev in self.events:
-                await self.broadcast(ev)
+                await self.send(ev)
             self.events.clear()
 
             src, an = self.source, self.analyzer
-            if src is None or an is None or not self.clients:
+            if src is None or an is None:
                 continue
             x = src.window(an.cfg.n_win)
             res = await asyncio.to_thread(an.process, x)
             res["type"] = "frame"
             if src.kind == "file":
                 res["file_pos"] = round(src.position() / src.fs, 2)
-            await self.broadcast(res)
+            await self.send(res)
 
-    async def broadcast(self, msg: dict):
-        if not self.clients:
-            return
-        text = json.dumps(msg, separators=(",", ":"))
-        dead = []
-        for ws in list(self.clients):
-            try:
-                await ws.send_text(text)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.clients.discard(ws)
+    async def send(self, msg: dict):
+        try:
+            await self.ws.send_text(json.dumps(msg, separators=(",", ":")))
+        except Exception:
+            pass                                     # closing: the receive loop ends the session
 
     # ---------- control from the UI ----------
     async def handle(self, msg: dict):
@@ -141,57 +156,67 @@ class Engine:
             self.gate_db = float(np.clip(float(msg["value"]), 3, 40))
             if self.analyzer:
                 self.analyzer.cfg.gate_db_above_noise = self.gate_db
-        elif cmd == "device":
+        elif cmd == "device":                        # a microphone on the server machine
             dev = msg.get("value")
             self.open_mic(None if dev in (None, "", "default") else int(dev))
+        elif cmd == "browser_mic":                   # PCM chunks follow as binary messages
+            self.open_browser_mic(float(msg.get("fs", 48000)), msg.get("name"))
+        elif cmd == "browser_mic_stop":
+            if isinstance(self.mic, BrowserMicSource):
+                self.close_mic()
+                self._new_analyzer()
         elif cmd == "stop_file":
             self.stop_file()
-        await self.broadcast(self.status())
+        await self.send(self.status())
 
 
-engine = Engine()
-
-
-@asynccontextmanager
-async def lifespan(app):
-    engine.open_mic(getattr(app.state, "device", None))
-    task = asyncio.create_task(engine.run())
-    yield
-    task.cancel()
-    if engine.mic:
-        engine.mic.close()
-
-
-app = FastAPI(title="Guitar FFT note & chord detector", lifespan=lifespan)
+sessions: dict[str, Session] = {}
+app = FastAPI(title="Guitar FFT note & chord detector")
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    engine.clients.add(ws)
-    await ws.send_text(json.dumps(engine.status()))
+    s = Session(ws)
+    sessions[s.sid] = s
+    s.open_mic(getattr(app.state, "device", None))
+    task = asyncio.create_task(s.run())
     try:
+        await s.send(s.status())
         while True:
-            try:
-                msg = json.loads(await ws.receive_text())
-            except json.JSONDecodeError:
-                continue
-            await engine.handle(msg)
-    except WebSocketDisconnect:
-        pass
+            m = await ws.receive()
+            if m["type"] == "websocket.disconnect":
+                break
+            if m.get("bytes") is not None:
+                s.feed(m["bytes"])
+            elif m.get("text"):
+                try:
+                    msg = json.loads(m["text"])
+                except json.JSONDecodeError:
+                    continue
+                await s.handle(msg)
     finally:
-        engine.clients.discard(ws)
+        task.cancel()
+        sessions.pop(s.sid, None)
+        s.close_mic()
+
+
+def _session(sid: str) -> Session:
+    s = sessions.get(sid)
+    if s is None:
+        raise HTTPException(409, "not connected: reload the page")
+    return s
 
 
 @app.get("/api/devices")
 def devices():
     try:
-        return {"devices": list_input_devices(), "current": engine.mic_device}
+        return {"devices": list_input_devices()}
     except Exception as e:
-        return {"devices": [], "current": None, "error": str(e)}
+        return {"devices": [], "error": str(e)}
 
 
-def _load_and_play(data: bytes, name: str):
+def _load_and_play(s: Session, data: bytes, name: str):
     try:
         x, fs = read_wav(data)
     except ValueError as e:
@@ -201,15 +226,18 @@ def _load_and_play(data: bytes, name: str):
     peak = np.abs(x).max()
     if peak > 0:
         x = x * (0.5 / peak)     # normalise so quiet recordings still open the gate
-    engine.play_file(x, fs, name)
-    engine.events.append(engine.status())
+    s.play_file(x, fs, name)
+    s.events.append(s.status())
     return {"name": name, "fs": fs, "duration": round(len(x) / fs, 2)}
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile = File(...)):
-    data = await file.read()
-    return _load_and_play(data, file.filename or "upload.wav")
+async def upload(sid: str, file: UploadFile = File(...)):
+    s = _session(sid)
+    data = await file.read(MAX_UPLOAD + 1)
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(413, "file is larger than 50 MB")
+    return _load_and_play(s, data, file.filename or "upload.wav")
 
 
 @app.get("/api/recordings")
@@ -219,22 +247,24 @@ def recordings():
 
 
 @app.post("/api/play/{name}")
-def play_recording(name: str):
+def play_recording(name: str, sid: str):
+    s = _session(sid)
     path = (REC_DIR / name).resolve()
     if path.parent != REC_DIR.resolve() or not path.is_file():
         raise HTTPException(404, "no such recording")
-    return _load_and_play(path.read_bytes(), name)
+    return _load_and_play(s, path.read_bytes(), name)
 
 
 @app.post("/api/record")
-def record(sec: float = 5.0, label: str = ""):
-    if engine.mic is None:
-        raise HTTPException(409, engine.mic_error or "microphone is not available")
+def record(sid: str, sec: float = 5.0, label: str = ""):
+    s = _session(sid)
+    if s.mic is None:
+        raise HTTPException(409, "no microphone is on")
     sec = float(np.clip(sec, 1, 15))
-    x = engine.mic.recent(sec)
+    x = s.mic.recent(sec)
     safe = re.sub(r"[^A-Za-z0-9#_-]+", "_", label).strip("_")
     name = time.strftime("rec-%Y%m%d-%H%M%S") + (f"-{safe}" if safe else "") + ".wav"
-    write_wav(REC_DIR / name, x, engine.mic.fs)
+    write_wav(REC_DIR / name, x, s.mic.fs)
     return {"name": name, "duration": sec}
 
 
